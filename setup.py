@@ -6,7 +6,7 @@ setup(
     long_description_content_type='text/markdown',
     packages = ['awscli.plugins.s3touch'],
     package_dir={'':'src'},
-    version = '0.1.0',
+    version = '0.1.1',
     install_requires=['awscli'],
     author='EMD Group (emdgroup.com)',
     url='https://github.com/merckgroup/awscli-s3touch',

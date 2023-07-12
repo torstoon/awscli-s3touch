@@ -82,6 +82,12 @@ class S3Touch(BasicCommand):
             'name': 'delimiter',
             'help_text': ('Character you use to group keys.')
         },
+        {
+            'name': 'sns-batch', 'cli_type_name': 'integer',
+            'help_text': (
+                'The number of records to process in a batch. The default '
+                'value is 1')
+        }
     ]
 
     def _run_main(self, parsed_args, parsed_globals):
@@ -101,6 +107,9 @@ class S3Touch(BasicCommand):
         )
         self._region = s3.get_bucket_location(Bucket=parsed_args.bucket)['LocationConstraint']
         self._caller = sts.get_caller_identity()
+        self._start_time = datetime.now()
+        self._records = []
+        self._total_records = 0
 
         paginator = s3.get_paginator('list_objects_v2')
         params = {
@@ -119,14 +128,22 @@ class S3Touch(BasicCommand):
             params['PaginationConfig']['MaxItems'] = parsed_args.max_items
         if parsed_args.starting_token is not None:
             params['PaginationConfig']['StartingToken'] = parsed_args.starting_token
+        if parsed_args.sns_batch is not None:
+            self._sns_batch = parsed_args.sns_batch
+        else:
+            self._sns_batch = 1
 
         iterator = paginator.paginate(**params)
 
         for response in iterator:
             if(response['KeyCount'] == 0):
-                print('We are done here')
+                print('No files found')
             else:
                 [self.process_file(parsed_args.bucket, file) for file in response['Contents']]
+
+        if(self._records not in (None, [])):
+            self.process_file(parsed_args.bucket, None)
+        sys.stdout.write('We are done here {} records processed'.format(self._total_records) + '\n}')
         return 0
 
     def process_file(self, bucket, file):
@@ -148,17 +165,38 @@ class S3Touch(BasicCommand):
                     print('{} is currently not supported'.format(key))
 
     def build_event(self, bucket, file, config):
+        if(file is None):
+            records =  json.dumps({'Records': self._records})
+            sys.stdout.write('Progress: {} records processed'.format(self._total_records) + '\n')
+            self._records = []
+            return records
+        
+        self._total_records += 1
+        self._records.append(self.build_record(bucket, file, config))
+
+        if(len(self._records) >= self._sns_batch):
+            records =  json.dumps({'Records': self._records})
+            sys.stdout.write('Progress: {} records processed'.format(self._total_records) + '\n')
+            self._records = []
+            return records
+        else:
+            return None
+        
+        
+    
+    def build_record(self, bucket, file, config):
         date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        return json.dumps({
-            'Records':[{
+        
+        return {
                 'eventVersion': '2.0', 'eventSource': 'aws:s3', 'awsRegion': self._region,
                 'userIdentity': { 'principalId': 'AWS:{}'.format(self._caller['UserId']) },
                 'eventTime': date, 'eventName': 'ObjectCreated:Put', 's3': {
                     'configurationId': config['Id'], 's3SchemaVersion': '1.0', 'object': {
                         'eTag': json.loads(file['ETag']), 'key': parse.quote_plus(file['Key']), 'size': file['Size'],
                     }, 'bucket': { 'arn': 'arn:aws:s3:::{}'.format(bucket), 'name': bucket }
-                }}]
-        })
+                }
+        }
+        
 
     def evaluate_filter(self, filter, file):
         for attr in filter:
@@ -182,11 +220,14 @@ class S3Touch(BasicCommand):
 
     def handle_topic_notification(self, bucket, file, config):
         event = self.build_event(bucket, file, config);
+        if(event is None):
+            return
         self._sns.publish(
             TopicArn=config['TopicArn'],
             Message=event
         )
-        sys.stdout.write('published "{}" to {}'.format(file['Key'], config['TopicArn']) + '\n')
+        sys.stdout.write('Time from app start: {}'.format(datetime.now() - self._start_time) + '\n')
+        sys.stdout.write('published "{}" to {}'.format("events", config['TopicArn']) + '\n')
 
     def handle_queue_notification(self, bucket, file, config):
         event = self.build_event(bucket, file, config);
